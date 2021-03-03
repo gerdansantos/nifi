@@ -18,11 +18,10 @@
 package org.apache.nifi.processors.kudu;
 
 import org.apache.kudu.Schema;
-import org.apache.kudu.client.AlterTableOptions;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduException;
-import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.KuduSession;
+import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.Operation;
 import org.apache.kudu.client.OperationResponse;
 import org.apache.kudu.client.RowError;
@@ -231,6 +230,8 @@ public class PutKudu extends AbstractKuduProcessor {
         properties.add(KUDU_MASTERS);
         properties.add(TABLE_NAME);
         properties.add(KERBEROS_CREDENTIALS_SERVICE);
+        properties.add(KERBEROS_PRINCIPAL);
+        properties.add(KERBEROS_PASSWORD);
         properties.add(SKIP_HEAD_LINE);
         properties.add(LOWERCASE_FIELD_NAMES);
         properties.add(HANDLE_SCHEMA_DRIFT);
@@ -258,7 +259,7 @@ public class PutKudu extends AbstractKuduProcessor {
         batchSize = context.getProperty(BATCH_SIZE).evaluateAttributeExpressions().asInteger();
         ffbatch   = context.getProperty(FLOWFILE_BATCH_SIZE).evaluateAttributeExpressions().asInteger();
         flushMode = SessionConfiguration.FlushMode.valueOf(context.getProperty(FLUSH_MODE).getValue().toUpperCase());
-        createKuduClient(context);
+        createKerberosUserAndOrKuduClient(context);
     }
 
     @Override
@@ -270,23 +271,22 @@ public class PutKudu extends AbstractKuduProcessor {
 
         final KerberosUser user = getKerberosUser();
         if (user == null) {
-            trigger(context, session, flowFiles);
+            executeOnKuduClient(kuduClient -> trigger(context, session, flowFiles, kuduClient));
             return;
         }
 
-        final PrivilegedExceptionAction<Void> privelegedAction = () -> {
-            trigger(context, session, flowFiles);
+        final PrivilegedExceptionAction<Void> privilegedAction = () -> {
+            executeOnKuduClient(kuduClient -> trigger(context, session, flowFiles, kuduClient));
             return null;
         };
 
-        final KerberosAction<Void> action = new KerberosAction<>(user, privelegedAction, getLogger());
+        final KerberosAction<Void> action = new KerberosAction<>(user, privilegedAction, getLogger());
         action.execute();
     }
 
-    private void trigger(final ProcessContext context, final ProcessSession session, final List<FlowFile> flowFiles) throws ProcessException {
+    private void trigger(final ProcessContext context, final ProcessSession session, final List<FlowFile> flowFiles, KuduClient kuduClient) throws ProcessException {
         final RecordReaderFactory recordReaderFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
 
-        final KuduClient kuduClient = getKuduClient();
         final KuduSession kuduSession = createKuduSession(kuduClient);
 
         final Map<FlowFile, Integer> numRecords = new HashMap<>();
@@ -324,10 +324,8 @@ public class PutKudu extends AbstractKuduProcessor {
                         // we created by a concurrent thread or application attempting to handle schema drift.
                         for (RecordField field : missing) {
                             try {
-                                String columnName = lowercaseFields ? field.getFieldName().toLowerCase() : field.getFieldName();
-                                AlterTableOptions alter = new AlterTableOptions();
-                                alter.addNullableColumn(columnName, toKuduType(field.getDataType()));
-                                kuduClient.alterTable(tableName, alter);
+                                final String columnName = lowercaseFields ? field.getFieldName().toLowerCase() : field.getFieldName();
+                                kuduClient.alterTable(tableName, getAddNullableColumnStatement(columnName, field.getDataType()));
                             } catch (KuduException e) {
                                 // Ignore the exception if the column already exists due to concurrent
                                 // threads or applications attempting to handle schema drift.

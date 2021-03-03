@@ -75,6 +75,8 @@ import org.apache.nifi.parameter.Parameter;
 import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.parameter.ParameterDescriptor;
 import org.apache.nifi.parameter.ParameterReference;
+import org.apache.nifi.parameter.ParameterUpdate;
+import org.apache.nifi.parameter.StandardParameterUpdate;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.StandardProcessContext;
 import org.apache.nifi.registry.ComponentVariableRegistry;
@@ -156,6 +158,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -192,6 +195,10 @@ public final class StandardProcessGroup implements ProcessGroup {
     private final MutableVariableRegistry variableRegistry;
     private final VersionControlFields versionControlFields = new VersionControlFields();
     private volatile ParameterContext parameterContext;
+
+    private FlowFileConcurrency flowFileConcurrency = FlowFileConcurrency.UNBOUNDED;
+    private volatile FlowFileGate flowFileGate = new UnboundedFlowFileGate();
+    private volatile FlowFileOutboundPolicy flowFileOutboundPolicy = FlowFileOutboundPolicy.STREAM_WHEN_AVAILABLE;
 
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final Lock readLock = rwLock.readLock();
@@ -371,7 +378,16 @@ public final class StandardProcessGroup implements ProcessGroup {
                 // update the vci counts for this child group
                 final VersionControlInformation vci = childGroup.getVersionControlInformation();
                 if (vci != null) {
-                    switch (vci.getStatus().getState()) {
+                    final VersionedFlowStatus flowStatus;
+                    try {
+                        flowStatus = vci.getStatus();
+                    } catch (final Exception e) {
+                        LOG.warn("Could not determine Version Control State for {}. Will consider state to be SYNC_FAILURE", this, e);
+                        syncFailure++;
+                        continue;
+                    }
+
+                    switch (flowStatus.getState()) {
                         case LOCALLY_MODIFIED:
                             locallyModified++;
                             break;
@@ -1643,7 +1659,10 @@ public final class StandardProcessGroup implements ProcessGroup {
 
     @Override
     public String toString() {
-        return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE).append("identifier", getIdentifier()).toString();
+        return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE)
+            .append("identifier", getIdentifier())
+            .append("name", getName())
+            .toString();
     }
 
     @Override
@@ -2629,7 +2648,12 @@ public final class StandardProcessGroup implements ProcessGroup {
     }
 
     @Override
-    public void verifyCanDelete(final boolean ignoreConnections) {
+    public void verifyCanDelete(final boolean ignorePortConnections) {
+        verifyCanDelete(ignorePortConnections, false);
+    }
+
+    @Override
+    public void verifyCanDelete(final boolean ignoreConnections, final boolean ignoreTemplates) {
         readLock.lock();
         try {
             for (final Port port : inputPorts.values()) {
@@ -2655,10 +2679,10 @@ public final class StandardProcessGroup implements ProcessGroup {
             for (final ProcessGroup childGroup : processGroups.values()) {
                 // For nested child groups we can ignore the input/output port
                 // connections as they will be being deleted anyway.
-                childGroup.verifyCanDelete(true);
+                childGroup.verifyCanDelete(true, ignoreTemplates);
             }
 
-            if (!templates.isEmpty()) {
+            if (!ignoreTemplates && !templates.isEmpty()) {
                 throw new IllegalStateException(String.format("Cannot delete Process Group because it contains %s Templates. The Templates must be deleted first.", templates.size()));
             }
 
@@ -2911,31 +2935,90 @@ public final class StandardProcessGroup implements ProcessGroup {
     @Override
     public void setParameterContext(final ParameterContext parameterContext) {
         verifyCanSetParameterContext(parameterContext);
+
+        // Determine which parameters have changed so that components can be appropriately updated.
+        final Map<String, ParameterUpdate> updatedParameters = mapParameterUpdates(this.parameterContext, parameterContext);
+        LOG.debug("Parameter Context for {} changed from {} to {}. This resulted in {} Parameter Updates ({}). Notifying Processors/Controller Services of the updates.",
+            this, this.parameterContext, parameterContext, updatedParameters.size(), updatedParameters);
+
         this.parameterContext = parameterContext;
 
-        getProcessors().forEach(ProcessorNode::resetValidationState);
-        getControllerServices(false).forEach(ControllerServiceNode::resetValidationState);
+        if (!updatedParameters.isEmpty()) {
+            // Notify components that parameters have been updated
+            onParameterContextUpdated(updatedParameters);
+        }
     }
 
     @Override
-    public void onParameterContextUpdated() {
+    public void onParameterContextUpdated(final Map<String, ParameterUpdate> updatedParameters) {
         readLock.lock();
         try {
-            for (final ProcessorNode processorNode : getProcessors()) {
-                if (processorNode.isReferencingParameter() && processorNode.getScheduledState() != ScheduledState.RUNNING) {
-                    processorNode.resetValidationState();
-                }
-            }
-
-            for (final ControllerServiceNode serviceNode : getControllerServices(false)) {
-                if (serviceNode.isReferencingParameter() && serviceNode.getState() == ControllerServiceState.DISABLING || serviceNode.getState() == ControllerServiceState.DISABLED) {
-                    serviceNode.resetValidationState();
-                }
-            }
+            getProcessors().forEach(proc -> proc.onParametersModified(updatedParameters));
+            getControllerServices(false).forEach(cs -> cs.onParametersModified(updatedParameters));
         } finally {
             readLock.unlock();
         }
     }
+
+    private Map<String, ParameterUpdate> mapParameterUpdates(final ParameterContext previousParameterContext, final ParameterContext updatedParameterContext) {
+        if (previousParameterContext == null && updatedParameterContext == null) {
+            return Collections.emptyMap();
+        }
+        if (updatedParameterContext == null) {
+            return createParameterUpdates(previousParameterContext, (descriptor, value) -> new StandardParameterUpdate(descriptor.getName(), value, null, descriptor.isSensitive()));
+        }
+        if (previousParameterContext == null) {
+            return createParameterUpdates(updatedParameterContext, (descriptor, value) -> new StandardParameterUpdate(descriptor.getName(), null, value, descriptor.isSensitive()));
+        }
+
+        // For each Parameter in the updated parameter context, add a ParameterUpdate to our map
+        final Map<String, ParameterUpdate> updatedParameters = new HashMap<>();
+        for (final Map.Entry<ParameterDescriptor, Parameter> entry : updatedParameterContext.getParameters().entrySet()) {
+            final ParameterDescriptor updatedDescriptor = entry.getKey();
+            final Parameter updatedParameter = entry.getValue();
+
+            final Optional<Parameter> previousParameterOption = previousParameterContext.getParameter(updatedDescriptor);
+            final String previousValue = previousParameterOption.map(Parameter::getValue).orElse(null);
+            final String updatedValue = updatedParameter.getValue();
+
+            if (!Objects.equals(previousValue, updatedValue)) {
+                final ParameterUpdate parameterUpdate = new StandardParameterUpdate(updatedDescriptor.getName(), previousValue, updatedValue, updatedDescriptor.isSensitive());
+                updatedParameters.put(updatedDescriptor.getName(), parameterUpdate);
+            }
+        }
+
+        // For each Parameter that was in the previous parameter context that is not in the updated Paramter Context, add a ParameterUpdate to our map with `null` for the updated value
+        for (final Map.Entry<ParameterDescriptor, Parameter> entry : previousParameterContext.getParameters().entrySet()) {
+            final ParameterDescriptor previousDescriptor = entry.getKey();
+            final Parameter previousParameter = entry.getValue();
+
+            final Optional<Parameter> updatedParameterOption = updatedParameterContext.getParameter(previousDescriptor);
+            if (updatedParameterOption.isPresent()) {
+                // The value exists in both Parameter Contexts. If it was changed, a Parameter Update has already been added to the map, above.
+                continue;
+            }
+
+            final ParameterUpdate parameterUpdate = new StandardParameterUpdate(previousDescriptor.getName(), previousParameter.getValue(), null, previousDescriptor.isSensitive());
+            updatedParameters.put(previousDescriptor.getName(), parameterUpdate);
+        }
+
+        return updatedParameters;
+    }
+
+    private Map<String, ParameterUpdate> createParameterUpdates(final ParameterContext parameterContext, final BiFunction<ParameterDescriptor, String, ParameterUpdate> parameterUpdateMapper) {
+        final Map<String, ParameterUpdate> updatedParameters = new HashMap<>();
+
+        for (final Map.Entry<ParameterDescriptor, Parameter> entry : parameterContext.getParameters().entrySet()) {
+            final ParameterDescriptor parameterDescriptor = entry.getKey();
+            final Parameter parameter = entry.getValue();
+
+            final ParameterUpdate parameterUpdate = parameterUpdateMapper.apply(parameterDescriptor, parameter.getValue());
+            updatedParameters.put(parameterDescriptor.getName(), parameterUpdate);
+        }
+
+        return updatedParameters;
+    }
+
 
     @Override
     public void verifyCanSetParameterContext(final ParameterContext parameterContext) {
@@ -3278,28 +3361,33 @@ public final class StandardProcessGroup implements ProcessGroup {
                     return new StandardVersionedFlowStatus(VersionedFlowState.SYNC_FAILURE, syncFailureExplanation);
                 }
 
-                final boolean modified = isModified();
-                if (!modified) {
-                    final VersionControlInformation vci = StandardProcessGroup.this.versionControlInfo.get();
-                    if (vci.getFlowSnapshot() == null) {
-                        return new StandardVersionedFlowStatus(VersionedFlowState.SYNC_FAILURE, "Process Group has not yet been synchronized with Flow Registry");
+                try {
+                    final boolean modified = isModified();
+                    if (!modified) {
+                        final VersionControlInformation vci = StandardProcessGroup.this.versionControlInfo.get();
+                        if (vci.getFlowSnapshot() == null) {
+                            return new StandardVersionedFlowStatus(VersionedFlowState.SYNC_FAILURE, "Process Group has not yet been synchronized with Flow Registry");
+                        }
                     }
+
+                    final boolean stale = versionControlFields.isStale();
+
+                    final VersionedFlowState flowState;
+                    if (modified && stale) {
+                        flowState = VersionedFlowState.LOCALLY_MODIFIED_AND_STALE;
+                    } else if (modified) {
+                        flowState = VersionedFlowState.LOCALLY_MODIFIED;
+                    } else if (stale) {
+                        flowState = VersionedFlowState.STALE;
+                    } else {
+                        flowState = VersionedFlowState.UP_TO_DATE;
+                    }
+
+                    return new StandardVersionedFlowStatus(flowState, flowState.getDescription());
+                } catch (final Exception e) {
+                    LOG.warn("Could not correctly determine Versioned Flow Status for {}. Will consider state to be SYNC_FAILURE", this, e);
+                    return new StandardVersionedFlowStatus(VersionedFlowState.SYNC_FAILURE, "Could not properly determine flow status due to: " + e);
                 }
-
-                final boolean stale = versionControlFields.isStale();
-
-                final VersionedFlowState flowState;
-                if (modified && stale) {
-                    flowState = VersionedFlowState.LOCALLY_MODIFIED_AND_STALE;
-                } else if (modified) {
-                    flowState = VersionedFlowState.LOCALLY_MODIFIED;
-                } else if (stale) {
-                    flowState = VersionedFlowState.STALE;
-                } else {
-                    flowState = VersionedFlowState.UP_TO_DATE;
-                }
-
-                return new StandardVersionedFlowStatus(flowState, flowState.getDescription());
             }
         };
 
@@ -3743,7 +3831,7 @@ public final class StandardProcessGroup implements ProcessGroup {
             ControllerServiceNode service = servicesByVersionedId.get(proposedService.getIdentifier());
             if (service == null) {
                 service = addControllerService(group, proposedService, componentIdSeed);
-                LOG.info("Added {} to {}", service, this);
+                LOG.info("Added {} to {}", service, group);
                 servicesAdded.put(proposedService.getIdentifier(), service);
             }
 
@@ -3774,6 +3862,28 @@ public final class StandardProcessGroup implements ProcessGroup {
 
             controllerServicesRemoved.remove(proposedService.getIdentifier());
         }
+
+        // Before we can update child groups, we must first remove any connections that are connected to those child groups' input/output ports.
+        // We cannot add or update connections yet, though. That must be done at the end, as it's possible that the component that is the source/destination of the connection
+        // has not yet been added.
+        final Map<String, Connection> connectionsByVersionedId = group.getConnections().stream()
+            .collect(Collectors.toMap(component -> component.getVersionedComponentId().orElse(
+                NiFiRegistryFlowMapper.generateVersionedComponentId(component.getIdentifier())), Function.identity()));
+        final Set<String> connectionsRemoved = new HashSet<>(connectionsByVersionedId.keySet());
+
+        for (final VersionedConnection proposedConnection : proposed.getConnections()) {
+            connectionsRemoved.remove(proposedConnection.getIdentifier());
+        }
+
+        // Connections must be the first thing to remove, not the last. Otherwise, we will fail
+        // to remove a component if it has a connection going to it!
+        for (final String removedVersionedId : connectionsRemoved) {
+            final Connection connection = connectionsByVersionedId.get(removedVersionedId);
+            LOG.info("Removing {} from {}", connection, group);
+            group.removeConnection(connection);
+            flowManager.onConnectionRemoved(connection);
+        }
+
 
         // Child groups
         final Map<String, ProcessGroup> childGroupsByVersionedId = group.getProcessGroups().stream()
@@ -3966,12 +4076,7 @@ public final class StandardProcessGroup implements ProcessGroup {
         }
 
 
-        // Connections
-        final Map<String, Connection> connectionsByVersionedId = group.getConnections().stream()
-                .collect(Collectors.toMap(component -> component.getVersionedComponentId().orElse(
-                        NiFiRegistryFlowMapper.generateVersionedComponentId(component.getIdentifier())), Function.identity()));
-        final Set<String> connectionsRemoved = new HashSet<>(connectionsByVersionedId.keySet());
-
+        // Add and update Connections
         for (final VersionedConnection proposedConnection : proposed.getConnections()) {
             final Connection connection = connectionsByVersionedId.get(proposedConnection.getIdentifier());
             if (connection == null) {
@@ -3985,20 +4090,9 @@ public final class StandardProcessGroup implements ProcessGroup {
                 updateConnection(connection, proposedConnection);
                 LOG.info("Updated {}", connection);
             }
-
-            connectionsRemoved.remove(proposedConnection.getIdentifier());
         }
 
         // Remove components that exist in the local flow but not the remote flow.
-
-        // Connections must be the first thing to remove, not the last. Otherwise, we will fail
-        // to remove a component if it has a connection going to it!
-        for (final String removedVersionedId : connectionsRemoved) {
-            final Connection connection = connectionsByVersionedId.get(removedVersionedId);
-            LOG.info("Removing {} from {}", connection, group);
-            group.removeConnection(connection);
-            flowManager.onConnectionRemoved(connection);
-        }
 
         // Once the appropriate connections have been removed, we may now update Processors' auto-terminated relationships.
         // We cannot do this above, in the 'updateProcessor' call because if a connection is removed and changed to auto-terminated,
@@ -4836,15 +4930,16 @@ public final class StandardProcessGroup implements ProcessGroup {
             return null;
         }
 
-        final NiFiRegistryFlowMapper mapper = new NiFiRegistryFlowMapper(flowController.getExtensionManager());
-        final VersionedProcessGroup versionedGroup = mapper.mapProcessGroup(this, controllerServiceProvider, flowController.getFlowRegistryClient(), false);
+        try {
+            final NiFiRegistryFlowMapper mapper = new NiFiRegistryFlowMapper(flowController.getExtensionManager());
+            final VersionedProcessGroup versionedGroup = mapper.mapProcessGroup(this, controllerServiceProvider, flowController.getFlowRegistryClient(), false);
 
-        final ComparableDataFlow currentFlow = new StandardComparableDataFlow("Local Flow", versionedGroup);
-        final ComparableDataFlow snapshotFlow = new StandardComparableDataFlow("Versioned Flow", vci.getFlowSnapshot());
+            final ComparableDataFlow currentFlow = new StandardComparableDataFlow("Local Flow", versionedGroup);
+            final ComparableDataFlow snapshotFlow = new StandardComparableDataFlow("Versioned Flow", vci.getFlowSnapshot());
 
-        final FlowComparator flowComparator = new StandardFlowComparator(snapshotFlow, currentFlow, getAncestorServiceIds(), new EvolvingDifferenceDescriptor());
-        final FlowComparison comparison = flowComparator.compare();
-        final Set<FlowDifference> differences = comparison.getDifferences().stream()
+            final FlowComparator flowComparator = new StandardFlowComparator(snapshotFlow, currentFlow, getAncestorServiceIds(), new EvolvingDifferenceDescriptor());
+            final FlowComparison comparison = flowComparator.compare();
+            final Set<FlowDifference> differences = comparison.getDifferences().stream()
                 .filter(difference -> difference.getDifferenceType() != DifferenceType.BUNDLE_CHANGED)
                 .filter(FlowDifferenceFilters.FILTER_ADDED_REMOVED_REMOTE_PORTS)
                 .filter(FlowDifferenceFilters.FILTER_PUBLIC_PORT_NAME_CHANGES)
@@ -4854,8 +4949,11 @@ public final class StandardProcessGroup implements ProcessGroup {
                 .filter(diff -> !FlowDifferenceFilters.isScheduledStateNew(diff))
                 .collect(Collectors.toCollection(HashSet::new));
 
-        LOG.debug("There are {} differences between this Local Flow and the Versioned Flow: {}", differences.size(), differences);
-        return differences;
+            LOG.debug("There are {} differences between this Local Flow and the Versioned Flow: {}", differences.size(), differences);
+            return differences;
+        } catch (final RuntimeException e) {
+            throw new RuntimeException("Could not compute differences between local flow and Versioned Flow in NiFi Registry for " + this, e);
+        }
     }
 
 
@@ -5185,5 +5283,94 @@ public final class StandardProcessGroup implements ProcessGroup {
                 }
             }
         }
+    }
+
+    @Override
+    public FlowFileGate getFlowFileGate() {
+        return flowFileGate;
+    }
+
+    @Override
+    public FlowFileConcurrency getFlowFileConcurrency() {
+        readLock.lock();
+        try {
+            return flowFileConcurrency;
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    @Override
+    public void setFlowFileConcurrency(final FlowFileConcurrency flowFileConcurrency) {
+        writeLock.lock();
+        try {
+            if (this.flowFileConcurrency == flowFileConcurrency) {
+                return;
+            }
+
+            this.flowFileConcurrency = flowFileConcurrency;
+            switch (flowFileConcurrency) {
+                case UNBOUNDED:
+                    flowFileGate = new UnboundedFlowFileGate();
+                    break;
+                case SINGLE_FLOWFILE_PER_NODE:
+                    flowFileGate = new SingleConcurrencyFlowFileGate(() -> !isDataQueued());
+                    break;
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean isDataQueued() {
+        return isDataQueued(connection -> true);
+    }
+
+    @Override
+    public boolean isDataQueuedForProcessing() {
+        // Data is queued for processing if a connection has data queued and the connection's destination is NOT an Output Port.
+        return isDataQueued(connection -> connection.getDestination().getConnectableType() != ConnectableType.OUTPUT_PORT);
+    }
+
+    private boolean isDataQueued(final Predicate<Connection> connectionFilter) {
+        readLock.lock();
+        try {
+            for (final Connection connection : this.connections.values()) {
+                // If the connection doesn't pass the filter, just skip over it.
+                if (!connectionFilter.test(connection)) {
+                    continue;
+                }
+
+                final boolean queueEmpty = connection.getFlowFileQueue().isEmpty();
+                if (!queueEmpty) {
+                    return true;
+                }
+            }
+
+            for (final ProcessGroup child : this.processGroups.values()) {
+                // Check if the child Process Group has any data enqueued. Note that we call #isDataQueued here and NOT
+                // #isDataQueeudForProcesing. I.e., regardless of whether this is called from #isDataQueued or #isDataQueuedForProcessing,
+                // for child groups, we only call #isDataQueued. This is because if data is queued up for the Output Port of a child group,
+                // it is still considered to be data that is being processed by this Process Group.
+                if (child.isDataQueued()) {
+                    return true;
+                }
+            }
+
+            return false;
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    @Override
+    public FlowFileOutboundPolicy getFlowFileOutboundPolicy() {
+        return flowFileOutboundPolicy;
+    }
+
+    @Override
+    public void setFlowFileOutboundPolicy(final FlowFileOutboundPolicy flowFileOutboundPolicy) {
+        this.flowFileOutboundPolicy = flowFileOutboundPolicy;
     }
 }
